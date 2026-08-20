@@ -1,0 +1,6 @@
+# OS / tooling
+.DS_Store
+node_modules/
+vendor/
+*.log
+*.zip
