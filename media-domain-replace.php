@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       Media Domain Replace
  * Description:       Rewrites media URLs from your local domain to a remote (staging/production) domain, so a local site can display uploads that only exist on the live server. Files uploaded locally keep their own URLs and can be watermarked so they are obvious at a glance.
- * Version:           1.4.0
+ * Version:           1.6.0
  * Requires at least: 5.6
  * Requires PHP:      7.2
  * Author:            Randal Traicoff
@@ -19,7 +19,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 define( 'MDR_PLUGIN_FILE', __FILE__ );
-define( 'MDR_VERSION', '1.4.0' );
+define( 'MDR_VERSION', '1.6.0' );
 
 final class MDR_Media_Domain_Replace {
 
@@ -47,7 +47,10 @@ final class MDR_Media_Domain_Replace {
 			'local_domain'        => '',
 			'uploads_only'        => 1,
 			'apply_in_admin'      => 1,
+			'restore_on_save'     => 1,
 			'preserve_local'      => 1,
+			'safe_mode'           => 1,
+			'extra_local_hosts'   => '',
 			'watermark_enabled'      => 1,
 			'watermark_style'        => 'text',
 			'watermark_text'         => 'LOCAL ONLY',
@@ -67,6 +70,7 @@ final class MDR_Media_Domain_Replace {
 
 	public static function init() {
 		add_action( 'admin_menu', array( __CLASS__, 'add_settings_page' ) );
+		add_action( 'admin_notices', array( __CLASS__, 'environment_notice' ) );
 		add_action( 'admin_init', array( __CLASS__, 'register_settings' ) );
 		add_action( 'admin_init', array( __CLASS__, 'maybe_upgrade' ), 5 );
 		add_action( 'after_switch_theme', array( __CLASS__, 'migrate_menu_locations' ) );
@@ -260,6 +264,104 @@ final class MDR_Media_Domain_Replace {
 	}
 
 	/**
+	 * Hostname suffixes reserved for, or conventionally used by, local
+	 * development. Anything outside this list is treated as a real site.
+	 *
+	 * This is an allow list on purpose. Blocking .com, .org, .io and so on
+	 * would mean chasing well over a thousand public suffixes, and missing one
+	 * fails open on a live site. Listing what counts as local cannot miss.
+	 */
+	public static function local_suffixes() {
+		return apply_filters(
+			'mdr_local_suffixes',
+			array(
+				'.local',      // Bonjour, DevKinsta, Local by Flywheel
+				'.test',       // reserved by RFC 6761
+				'.localhost',  // reserved by RFC 6761
+				'.invalid',    // reserved by RFC 6761
+				'.example',    // reserved by RFC 6761
+				'.internal',
+				'.ddev.site',  // DDEV
+				'.lndo.site',  // Lando
+				'.vagrant',
+				'.wip',
+			)
+		);
+	}
+
+	/**
+	 * Extra hosts the site owner has vouched for.
+	 */
+	public static function extra_local_hosts() {
+		$raw = (string) self::get( 'extra_local_hosts' );
+		if ( '' === trim( $raw ) ) {
+			return array();
+		}
+
+		$hosts = preg_split( '/[\s,]+/', strtolower( $raw ), -1, PREG_SPLIT_NO_EMPTY );
+
+		return is_array( $hosts ) ? $hosts : array();
+	}
+
+	/**
+	 * Does this install look like a development site?
+	 *
+	 * Everything the plugin does is gated on this, because both halves of it
+	 * are destructive in the wrong place: rewriting would point media at the
+	 * wrong server, and watermarking burns text into files permanently.
+	 */
+	public static function is_local_environment() {
+		if ( empty( self::get( 'safe_mode' ) ) ) {
+			return true;
+		}
+
+		$host = strtolower( preg_replace( '/:\d+$/', '', self::local_host() ) );
+
+		if ( '' === $host ) {
+			return false;
+		}
+
+		$local = false;
+
+		// An explicitly declared environment is the most reliable signal there
+		// is, so it wins in both directions.
+		$declared = defined( 'WP_ENVIRONMENT_TYPE' ) ? strtolower( (string) WP_ENVIRONMENT_TYPE ) : '';
+
+		if ( in_array( $declared, array( 'local', 'development' ), true ) ) {
+			$local = true;
+		} elseif ( in_array( $declared, array( 'production', 'staging' ), true ) ) {
+			$local = false;
+		} elseif ( in_array( $host, array( 'localhost', '::1' ), true ) ) {
+			$local = true;
+		} elseif ( filter_var( $host, FILTER_VALIDATE_IP ) ) {
+			// Private and reserved ranges only: 127.x, 10.x, 192.168.x and so on.
+			$local = ! filter_var( $host, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE );
+		} else {
+			foreach ( self::local_suffixes() as $suffix ) {
+				if ( substr( $host, -strlen( $suffix ) ) === $suffix ) {
+					$local = true;
+					break;
+				}
+			}
+		}
+
+		// Hosts the owner has explicitly vouched for override the guess.
+		if ( ! $local ) {
+			foreach ( self::extra_local_hosts() as $extra ) {
+				if ( $host === $extra || ( 0 === strpos( $extra, '.' ) && substr( $host, -strlen( $extra ) ) === $extra ) ) {
+					$local = true;
+					break;
+				}
+			}
+		}
+
+		/**
+		 * Filter whether this install counts as a development environment.
+		 */
+		return (bool) apply_filters( 'mdr_is_local_environment', $local, $host );
+	}
+
+	/**
 	 * Should any rewriting happen on this request?
 	 */
 	public static function should_run() {
@@ -268,6 +370,10 @@ final class MDR_Media_Domain_Replace {
 		}
 
 		$run = true;
+
+		if ( ! self::is_local_environment() ) {
+			$run = false;
+		}
 
 		if ( empty( self::get( 'enabled' ) ) ) {
 			$run = false;
@@ -323,14 +429,26 @@ final class MDR_Media_Domain_Replace {
 		add_filter( 'wp_get_attachment_thumb_url', array( __CLASS__, 'filter_url' ), 10, 1 );
 		add_filter( 'wp_get_attachment_image_src', array( __CLASS__, 'filter_image_src' ), 10, 1 );
 		add_filter( 'wp_calculate_image_srcset', array( __CLASS__, 'filter_srcset' ), 10, 1 );
+		add_filter( 'wp_get_attachment_image_attributes', array( __CLASS__, 'filter_image_attributes' ), 10, 1 );
+		add_filter( 'the_guid', array( __CLASS__, 'filter_url' ), 10, 1 );
+
+		// Media Library grid and list, the media modal, and the block editor
+		// all read attachments through these two.
 		add_filter( 'wp_prepare_attachment_for_js', array( __CLASS__, 'filter_attachment_js' ), 10, 1 );
+		add_filter( 'rest_prepare_attachment', array( __CLASS__, 'filter_rest_attachment' ), 10, 1 );
 
 		// Rendered markup.
 		add_filter( 'the_content', array( __CLASS__, 'filter_content' ), 20, 1 );
 		add_filter( 'post_thumbnail_html', array( __CLASS__, 'filter_content' ), 20, 1 );
+		add_filter( 'wp_get_attachment_image', array( __CLASS__, 'filter_content' ), 20, 1 );
 		add_filter( 'acf_the_content', array( __CLASS__, 'filter_content' ), 20, 1 );
 		add_filter( 'widget_text', array( __CLASS__, 'filter_content' ), 20, 1 );
 		add_filter( 'render_block', array( __CLASS__, 'filter_content' ), 20, 1 );
+
+		// Put local URLs back before anything is written to the database.
+		if ( ! empty( self::get( 'restore_on_save' ) ) ) {
+			add_filter( 'wp_insert_post_data', array( __CLASS__, 'restore_post_data' ), 10, 1 );
+		}
 
 		/**
 		 * Fires after the plugin's own filters are registered, so themes can
@@ -448,6 +566,122 @@ final class MDR_Media_Domain_Replace {
 	}
 
 	/**
+	 * src and srcset on generated <img> tags.
+	 */
+	public static function filter_image_attributes( $attr ) {
+		if ( ! is_array( $attr ) ) {
+			return $attr;
+		}
+
+		if ( ! empty( $attr['src'] ) ) {
+			$attr['src'] = self::filter_url( $attr['src'] );
+		}
+
+		if ( ! empty( $attr['srcset'] ) ) {
+			$attr['srcset'] = self::filter_content( $attr['srcset'] );
+		}
+
+		return $attr;
+	}
+
+	/**
+	 * The REST response behind the block editor's media views.
+	 *
+	 * source_url and the per size URLs are already covered by the attachment
+	 * filters, but guid and the rendered caption fields are not.
+	 */
+	public static function filter_rest_attachment( $response ) {
+		if ( ! is_object( $response ) || ! isset( $response->data ) || ! is_array( $response->data ) ) {
+			return $response;
+		}
+
+		$data = $response->data;
+
+		if ( ! empty( $data['source_url'] ) ) {
+			$data['source_url'] = self::filter_url( $data['source_url'] );
+		}
+
+		if ( ! empty( $data['guid']['rendered'] ) ) {
+			$data['guid']['rendered'] = self::filter_url( $data['guid']['rendered'] );
+		}
+
+		if ( ! empty( $data['media_details']['sizes'] ) && is_array( $data['media_details']['sizes'] ) ) {
+			foreach ( $data['media_details']['sizes'] as $name => $size ) {
+				if ( ! empty( $size['source_url'] ) ) {
+					$data['media_details']['sizes'][ $name ]['source_url'] = self::filter_url( $size['source_url'] );
+				}
+			}
+		}
+
+		foreach ( array( 'caption', 'description' ) as $field ) {
+			if ( ! empty( $data[ $field ]['rendered'] ) ) {
+				$data[ $field ]['rendered'] = self::filter_content( $data[ $field ]['rendered'] );
+			}
+		}
+
+		$response->data = $data;
+
+		return $response;
+	}
+
+	/**
+	 * Put local URLs back on the way into the database.
+	 *
+	 * Showing remote media in the editor means the editor also inserts remote
+	 * URLs when you add an image. Left alone those get saved into post content
+	 * and would travel with the database, so they are swapped back here. Only
+	 * uploads URLs are touched, so a deliberate link to the live site survives.
+	 */
+	public static function restore_post_data( $data ) {
+		if ( ! is_array( $data ) || ! self::should_run() ) {
+			return $data;
+		}
+
+		foreach ( array( 'post_content', 'post_excerpt' ) as $field ) {
+			if ( ! empty( $data[ $field ] ) && is_string( $data[ $field ] ) ) {
+				$data[ $field ] = self::restore_local_urls( $data[ $field ] );
+			}
+		}
+
+		return $data;
+	}
+
+	/**
+	 * The inverse of filter_content(), for uploads URLs only.
+	 */
+	public static function restore_local_urls( $content ) {
+		if ( ! is_string( $content ) || '' === $content ) {
+			return $content;
+		}
+
+		$local  = self::local_host();
+		$remote = self::remote_host();
+
+		if ( '' === $local || '' === $remote || $local === $remote ) {
+			return $content;
+		}
+
+		if ( false === strpos( $content, $remote ) ) {
+			return $content;
+		}
+
+		$uploads = self::uploads_path();
+		$escaped = str_replace( '/', '\/', $uploads );
+
+		return str_replace(
+			array(
+				'//' . $remote . $uploads,
+				'\/\/' . $remote . $escaped,
+			),
+			array(
+				'//' . $local . $uploads,
+				'\/\/' . $local . $escaped,
+			),
+			$content
+		);
+	}
+
+	/**
 	 * Media library / block editor attachment data.
 	 */
 	public static function filter_attachment_js( $response ) {
@@ -496,6 +730,12 @@ final class MDR_Media_Domain_Replace {
 
 	public static function watermarking_active() {
 		if ( empty( self::get( 'watermark_enabled' ) ) || ! self::watermarking_available() ) {
+			return false;
+		}
+
+		// Watermarking edits files in place and cannot be undone, so it never
+		// runs anywhere that does not look like a development site.
+		if ( ! self::is_local_environment() ) {
 			return false;
 		}
 
@@ -1401,6 +1641,33 @@ final class MDR_Media_Domain_Replace {
 		return $links;
 	}
 
+	/**
+	 * Tell administrators when the plugin has parked itself, so a site that
+	 * looks live does not quietly appear broken or, worse, appear to work.
+	 */
+	public static function environment_notice() {
+		if ( ! current_user_can( 'manage_options' ) || self::is_local_environment() ) {
+			return;
+		}
+
+		$settings = self::settings();
+		if ( empty( $settings['enabled'] ) && empty( $settings['watermark_enabled'] ) ) {
+			return;
+		}
+
+		printf(
+			'<div class="notice notice-warning"><p><strong>%s</strong> %s <a href="%s">%s</a></p></div>',
+			esc_html__( 'Media Domain Replace is idle.', 'media-domain-replace' ),
+			sprintf(
+				/* translators: %s: host name */
+				esc_html__( '%s does not look like a local development host, so URL rewriting and watermarking are both switched off.', 'media-domain-replace' ),
+				'<code>' . esc_html( self::local_host() ) . '</code>'
+			),
+			esc_url( admin_url( 'upload.php?page=media-domain-replace' ) ),
+			esc_html__( 'Review settings', 'media-domain-replace' )
+		);
+	}
+
 	public static function add_settings_page() {
 		add_submenu_page(
 			'upload.php',
@@ -1446,10 +1713,13 @@ final class MDR_Media_Domain_Replace {
 
 		$fields = array(
 			'enabled'            => array( __( 'Enable rewriting', 'media-domain-replace' ), 'mdr_main' ),
+			'safe_mode'          => array( __( 'Local sites only', 'media-domain-replace' ), 'mdr_main' ),
+			'extra_local_hosts'  => array( __( 'Additional local hosts', 'media-domain-replace' ), 'mdr_main' ),
 			'remote_domain'      => array( __( 'Remote media domain', 'media-domain-replace' ), 'mdr_main' ),
 			'local_domain'       => array( __( 'Local domain override', 'media-domain-replace' ), 'mdr_main' ),
 			'uploads_only'       => array( __( 'Uploads only', 'media-domain-replace' ), 'mdr_main' ),
-			'apply_in_admin'     => array( __( 'Apply in admin', 'media-domain-replace' ), 'mdr_main' ),
+			'apply_in_admin'     => array( __( 'Media Library and editor', 'media-domain-replace' ), 'mdr_main' ),
+			'restore_on_save'    => array( __( 'Restore local URLs on save', 'media-domain-replace' ), 'mdr_main' ),
 			'preserve_local'     => array( __( 'Preserve local files', 'media-domain-replace' ), 'mdr_local' ),
 			'watermark_enabled'  => array( __( 'Watermark new uploads', 'media-domain-replace' ), 'mdr_local' ),
 			'watermark_style'    => array( __( 'Watermark style', 'media-domain-replace' ), 'mdr_local' ),
@@ -1483,8 +1753,30 @@ final class MDR_Media_Domain_Replace {
 		$clean = self::defaults();
 
 		$clean['enabled']            = empty( $input['enabled'] ) ? 0 : 1;
+		$clean['safe_mode']          = empty( $input['safe_mode'] ) ? 0 : 1;
+
+		$extra = isset( $input['extra_local_hosts'] ) ? wp_unslash( $input['extra_local_hosts'] ) : '';
+		$extra = preg_split( '/[\r\n,]+/', strtolower( (string) $extra ), -1, PREG_SPLIT_NO_EMPTY );
+		$extra = is_array( $extra ) ? array_map( 'trim', $extra ) : array();
+		$extra = array_filter(
+			$extra,
+			function ( $host ) {
+				return (bool) preg_match( '~^\.?[a-z0-9.:-]+$~', $host );
+			}
+		);
+		$clean['extra_local_hosts'] = implode( "\n", $extra );
+
+		if ( empty( $clean['safe_mode'] ) ) {
+			add_settings_error(
+				self::OPTION,
+				'mdr_safe_mode_off',
+				__( 'The local site check is off. This plugin will now rewrite URLs and permanently watermark uploads on whatever site it is installed on.', 'media-domain-replace' ),
+				'warning'
+			);
+		}
 		$clean['uploads_only']       = empty( $input['uploads_only'] ) ? 0 : 1;
 		$clean['apply_in_admin']     = empty( $input['apply_in_admin'] ) ? 0 : 1;
+		$clean['restore_on_save']    = empty( $input['restore_on_save'] ) ? 0 : 1;
 		$clean['preserve_local']     = empty( $input['preserve_local'] ) ? 0 : 1;
 		$clean['watermark_enabled']  = empty( $input['watermark_enabled'] ) ? 0 : 1;
 		$clean['watermark_original'] = empty( $input['watermark_original'] ) ? 0 : 1;
@@ -1598,6 +1890,38 @@ final class MDR_Media_Domain_Replace {
 				echo '<p class="description">' . esc_html__( 'Turn this off to disable the plugin without deactivating it.', 'media-domain-replace' ) . '</p>';
 				break;
 
+			case 'safe_mode':
+				self::checkbox( $id, $name, $value, __( 'Only run on hosts that look like local development', 'media-domain-replace' ) );
+
+				printf(
+					'<p class="description">%s <code>%s</code></p>',
+					esc_html__( 'Recognised as local: localhost, private IP addresses, and these suffixes:', 'media-domain-replace' ),
+					esc_html( implode( ' ', self::local_suffixes() ) )
+				);
+				echo '<p class="description">' . esc_html__( 'A site declaring WP_ENVIRONMENT_TYPE as local or development always qualifies; one declaring production or staging never does. Leave this on unless you know what you are doing, since watermarking cannot be undone.', 'media-domain-replace' ) . '</p>';
+
+				if ( ! self::is_local_environment() ) {
+					printf(
+						'<p class="description"><strong>%s</strong></p>',
+						sprintf(
+							/* translators: %s: host name */
+							esc_html__( 'This site (%s) is not recognised as local, so the plugin is currently doing nothing.', 'media-domain-replace' ),
+							esc_html( self::local_host() )
+						)
+					);
+				}
+				break;
+
+			case 'extra_local_hosts':
+				printf(
+					'<textarea id="%1$s" name="%2$s" rows="3" class="large-text code" placeholder="staging.example.com&#10;.dev.mycompany.com">%3$s</textarea>',
+					esc_attr( $id ),
+					esc_attr( $name ),
+					esc_textarea( $value )
+				);
+				echo '<p class="description">' . esc_html__( 'One per line. Treat these as local too. Start an entry with a dot to match any subdomain of it. Only add hosts whose files you are happy to have permanently watermarked.', 'media-domain-replace' ) . '</p>';
+				break;
+
 			case 'remote_domain':
 				self::text( $id, $name, $value, 'example.kinsta.cloud' );
 				echo '<p class="description">' . esc_html__( 'Host where the media actually lives, for example uavionix2026reboot.kinsta.cloud. Leave off http:// and any trailing slash; a port is allowed.', 'media-domain-replace' ) . '</p>';
@@ -1618,8 +1942,13 @@ final class MDR_Media_Domain_Replace {
 				break;
 
 			case 'apply_in_admin':
-				self::checkbox( $id, $name, $value, __( 'Also rewrite in the admin area and REST requests', 'media-domain-replace' ) );
-				echo '<p class="description">' . esc_html__( 'Needed for thumbnails to show in the Media Library and block editor. Be aware that inserting an image into a post while this is on can store the remote URL in your content.', 'media-domain-replace' ) . '</p>';
+				self::checkbox( $id, $name, $value, __( 'Load remote media in the Media Library, media modal and block editor', 'media-domain-replace' ) );
+				echo '<p class="description">' . esc_html__( 'Leave this on so the gallery shows real thumbnails instead of broken ones. It also covers REST requests, which is how the block editor fetches media.', 'media-domain-replace' ) . '</p>';
+				break;
+
+			case 'restore_on_save':
+				self::checkbox( $id, $name, $value, __( 'Swap remote URLs back to local when content is saved', 'media-domain-replace' ) );
+				echo '<p class="description">' . esc_html__( 'Recommended whenever the setting above is on. Inserting an image in the editor would otherwise store the remote URL in your post content, where it would travel with the database. Only uploads URLs are swapped back, so a deliberate link to the live site is left alone.', 'media-domain-replace' ) . '</p>';
 				break;
 
 			case 'preserve_local':
@@ -1833,7 +2162,8 @@ final class MDR_Media_Domain_Replace {
 		$local   = self::local_host();
 		$remote  = self::remote_host();
 		$enabled = ! empty( self::get( 'enabled' ) );
-		$active  = $enabled && '' !== $remote && '' !== $local && $local !== $remote;
+		$is_dev  = self::is_local_environment();
+		$active  = $is_dev && $enabled && '' !== $remote && '' !== $local && $local !== $remote;
 
 		$processed = isset( $_GET['mdr_processed'] ) ? (int) $_GET['mdr_processed'] : -1; // phpcs:ignore WordPress.Security.NonceVerification.Recommended
 		?>
@@ -1864,6 +2194,14 @@ final class MDR_Media_Domain_Replace {
 							esc_html__( 'Media requested from %1$s is being served from %2$s, except for files that exist locally.', 'media-domain-replace' ),
 							'<code>' . esc_html( $local ) . '</code>',
 							'<code>' . esc_html( $remote ) . '</code>'
+						);
+						?>
+					<?php elseif ( ! $is_dev ) : ?>
+						<?php
+						printf(
+							/* translators: %s: host name */
+							esc_html__( '%s is not recognised as a local development host, so nothing is being rewritten or watermarked.', 'media-domain-replace' ),
+							'<code>' . esc_html( $local ) . '</code>'
 						);
 						?>
 					<?php elseif ( ! $enabled ) : ?>
@@ -1910,6 +2248,21 @@ final class MDR_Media_Domain_Replace {
 					<tr>
 						<td><?php esc_html_e( 'Uploads folder', 'media-domain-replace' ); ?></td>
 						<td><code><?php echo esc_html( self::uploads_dir() ); ?></code></td>
+					</tr>
+					<tr>
+						<td><?php esc_html_e( 'Environment', 'media-domain-replace' ); ?></td>
+						<td>
+							<?php
+							if ( $is_dev ) {
+								esc_html_e( 'Treated as local development', 'media-domain-replace' );
+							} else {
+								echo '<strong>' . esc_html__( 'Not treated as local, plugin is idle', 'media-domain-replace' ) . '</strong>';
+							}
+							if ( defined( 'WP_ENVIRONMENT_TYPE' ) ) {
+								printf( ' (<code>WP_ENVIRONMENT_TYPE: %s</code>)', esc_html( WP_ENVIRONMENT_TYPE ) );
+							}
+							?>
+						</td>
 					</tr>
 					<tr>
 						<td><?php esc_html_e( 'GD image library', 'media-domain-replace' ); ?></td>
